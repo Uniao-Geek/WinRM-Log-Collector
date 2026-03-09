@@ -1,0 +1,6 @@
+# Lab/internal config - do not publish (repo is public)
+CONFIG-LAB.md
+
+# Logs
+log/
+*.log
