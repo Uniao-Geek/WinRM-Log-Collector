@@ -4,3 +4,6 @@ CONFIG-LAB.md
 # Logs
 log/
 *.log
+publish-releases.ps1
+winrmconfig_v2.1.ps1
+winrmconfig_v2.2.ps1
