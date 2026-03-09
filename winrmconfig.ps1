@@ -53,7 +53,7 @@
     Email: contato@uniaogeek.com.br
     LinkedIn: https://www.linkedin.com/in/mrhenrike
     Instagram: @uniaogeek
-    Version: 2.3.0
+    Version: 2.3.2
 #>
 
 [CmdletBinding()]
@@ -122,12 +122,128 @@ param(
     # Help language: only applies to ShowHelp / ShowHelpLong (default en-US; use pt-BR for Portuguese)
     [Parameter()]
     [ValidateSet("en-US", "pt-BR")]
-    [string]$Language = "en-US"
+    [string]$Language = "en-US",
+    # Report: output to screen (default) or export to file
+    [Parameter()]
+    [ValidateSet("Screen", "Html", "Txt")]
+    [string]$ReportFormat = "Screen",
+    [Parameter()]
+    [string]$ReportOutputPath,
+    # Skip confirmation prompts for policies/firewall when set (use in automation)
+    [Parameter()]
+    [switch]$NoPrompt
 )
 
 # Global variables
-$ScriptVersion = "2.3.0"
+$ScriptVersion = "2.3.2"
 $Global:RestartRequired = $false
+
+# Required PowerShell modules with impact description per function
+# (Name, Description, AffectedActions: which -Action values need this module)
+$Script:RequiredModules = @(
+    @{
+        Name = "NetSecurity"
+        MinimumVersion = "1.0.0"
+        Description = "Windows Firewall management (Get-NetFirewallRule, New-NetFirewallRule, etc.)"
+        AffectedActions = @("Enable", "Disable", "ConfigureFirewall", "EnsureWinRM", "Status", "Report")
+        Impact = "Without NetSecurity: firewall rules cannot be listed, created or validated. Actions 'ConfigureFirewall', 'EnsureWinRM', 'Enable', 'Status' and 'Report' will fail or skip firewall steps."
+    },
+    @{
+        Name = "Microsoft.PowerShell.LocalAccounts"
+        MinimumVersion = "1.0.0"
+        Description = "Local users and groups (Get-LocalUser, Get-LocalGroupMember)"
+        AffectedActions = @("Enable", "CheckPermissions")
+        Impact = "Without LocalAccounts: local user validation and Event Log Readers group membership checks will fail. Actions 'Enable' and 'CheckPermissions' cannot verify or add local users."
+    }
+)
+
+# Fast module check: tries to import, does NOT scan all modules on disk (Get-Module -ListAvailable is slow)
+function Test-RequiredModules {
+    $missing = @()
+    foreach ($mod in $Script:RequiredModules) {
+        $loaded = Get-Module -Name $mod.Name -ErrorAction SilentlyContinue
+        if (-not $loaded) {
+            # Try to import (fast - uses already-cached module list in session)
+            try {
+                Import-Module -Name $mod.Name -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null
+            } catch {
+                $missing += $mod
+            }
+        }
+    }
+    return $missing
+}
+
+# Check if a specific module is available (fast import attempt, used at runtime per function)
+function Assert-ModuleAvailable {
+    param([string]$ModuleName, [string]$FunctionContext = "")
+    $loaded = Get-Module -Name $ModuleName -ErrorAction SilentlyContinue
+    if ($loaded) { return $true }
+    try {
+        Import-Module -Name $ModuleName -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null
+        return $true
+    } catch {
+        $mod = $Script:RequiredModules | Where-Object { $_.Name -eq $ModuleName } | Select-Object -First 1
+        $impact = if ($mod) { $mod.Impact } else { "This function requires module '$ModuleName'." }
+        Write-Host ""
+        Write-Host "  [MODULE MISSING] $ModuleName" -ForegroundColor Red
+        if ($FunctionContext) { Write-Host "  Context: $FunctionContext" -ForegroundColor Yellow }
+        Write-Host "  $impact" -ForegroundColor Yellow
+        Write-Host "  To install: Install-Module $ModuleName -Scope CurrentUser -Force" -ForegroundColor Cyan
+        Write-Host "  Note: PowerShell execution policy must allow script execution (Set-ExecutionPolicy RemoteSigned -Scope CurrentUser)" -ForegroundColor Cyan
+        Write-Host ""
+        return $false
+    }
+}
+
+function Install-RequiredModules {
+    param([array]$ModulesToInstall)
+    # Check execution policy before attempting install
+    $policy = Get-ExecutionPolicy -Scope CurrentUser
+    if ($policy -eq "Restricted") {
+        Write-Host ""
+        Write-Host "  WARNING: PowerShell execution policy is 'Restricted'." -ForegroundColor Yellow
+        Write-Host "  Module installation may fail. To allow: Set-ExecutionPolicy RemoteSigned -Scope CurrentUser" -ForegroundColor Cyan
+        Write-Host ""
+    }
+    foreach ($mod in $ModulesToInstall) {
+        Write-Host "  Installing: $($mod.Name)..." -ForegroundColor Cyan
+        try {
+            Install-Module -Name $mod.Name -MinimumVersion $mod.MinimumVersion -Scope CurrentUser -Force -AllowClobber -ErrorAction Stop
+            Import-Module -Name $mod.Name -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null
+            Write-Host "  Installed and loaded: $($mod.Name)" -ForegroundColor Green
+        } catch {
+            Write-Host "  Failed to install $($mod.Name): $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "  Impact: $($mod.Impact)" -ForegroundColor Yellow
+            Write-Host "  Manual install: Install-Module $($mod.Name) -Scope CurrentUser -Force" -ForegroundColor Cyan
+        }
+    }
+}
+
+# At load: fast check (import attempt, not full disk scan)
+$missingModules = Test-RequiredModules
+if ($missingModules.Count -gt 0) {
+    Write-Host ""
+    Write-Host "  [STARTUP CHECK] The following PowerShell modules are required but not available:" -ForegroundColor Yellow
+    foreach ($m in $missingModules) {
+        Write-Host "  - $($m.Name): $($m.Description)" -ForegroundColor Gray
+        Write-Host "    Impact: $($m.Impact)" -ForegroundColor DarkYellow
+        Write-Host "    Affected actions: $($m.AffectedActions -join ', ')" -ForegroundColor Gray
+    }
+    Write-Host ""
+    $response = Read-Host "  Install missing modules now? (y/n)"
+    if ($response -match '^[yY]') {
+        Install-RequiredModules -ModulesToInstall $missingModules
+    } else {
+        Write-Host ""
+        Write-Host "  Skipped. Some actions will be unavailable or partially functional:" -ForegroundColor Yellow
+        foreach ($m in $missingModules) {
+            Write-Host "  - $($m.Impact)" -ForegroundColor DarkYellow
+        }
+        Write-Host "  Install later: Install-Module $( ($missingModules | ForEach-Object { $_.Name }) -join ', ' ) -Scope CurrentUser -Force" -ForegroundColor Cyan
+    }
+    Write-Host ""
+}
 
 # Create log directory if it doesn't exist
 if (-not (Test-Path $LogPath)) {
@@ -160,14 +276,67 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $logEntry -Encoding UTF8
 }
 
-# Add firewall rule only if DisplayName does not exist (idempotent, like Enable-WindowsRemoteAccess.ps1)
+# Fast helper: get WinRM/WEC firewall rules by display name pattern (avoids full enum)
+function Get-WinRMFirewallRules {
+    # Query only rules matching WinRM or WEC by name — much faster than enumerating all rules
+    if (-not (Assert-ModuleAvailable "NetSecurity" "Get-WinRMFirewallRules")) { return @() }
+    $rules = @()
+    try { $rules += Get-NetFirewallRule -DisplayName "*WinRM*" -ErrorAction SilentlyContinue } catch {}
+    try { $rules += Get-NetFirewallRule -DisplayName "*WEC*" -ErrorAction SilentlyContinue } catch {}
+    return $rules
+}
+
+# Check if a firewall rule already exists by protocol, port, direction
+# Uses targeted query (by name pattern) instead of full enumeration for performance
+function Test-FirewallRuleExistsByPortProtocol {
+    param(
+        [int]$LocalPort,
+        [string]$Protocol = "TCP",
+        [string]$Direction = "Inbound"
+    )
+    if (-not (Assert-ModuleAvailable "NetSecurity" "Test-FirewallRuleExistsByPortProtocol")) { return $false }
+    # Query rules by name patterns first (fast), then also check all inbound rules for the port
+    $candidates = @()
+    try { $candidates += Get-NetFirewallRule -DisplayName "*WinRM*" -ErrorAction SilentlyContinue } catch {}
+    try { $candidates += Get-NetFirewallRule -DisplayName "*WEC*" -ErrorAction SilentlyContinue } catch {}
+    try { $candidates += Get-NetFirewallRule -DisplayName "*Remote Management*" -ErrorAction SilentlyContinue } catch {}
+    # Also check all enabled inbound rules on the target port using port filter lookup
+    try {
+        $portFilters = Get-NetFirewallPortFilter -Protocol $Protocol -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -eq $LocalPort -or $_.LocalPort -eq "Any" }
+        foreach ($pf in $portFilters) {
+            try {
+                $r = $pf | Get-NetFirewallRule -ErrorAction SilentlyContinue
+                if ($r -and $r.Direction -eq $Direction -and $r.Enabled -ne "False") { return $true }
+            } catch {}
+        }
+    } catch {}
+    foreach ($r in $candidates) {
+        if ($r.Direction -ne $Direction -or $r.Enabled -eq "False") { continue }
+        try {
+            $pf = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $r -ErrorAction SilentlyContinue
+            if ($pf -and ($pf.LocalPort -eq $LocalPort -or $pf.LocalPort -eq "Any") -and $pf.Protocol -eq $Protocol) { return $true }
+        } catch {}
+    }
+    return $false
+}
+
+# Add firewall rule only if no rule exists for same port/protocol/direction (validates to avoid duplicates)
 function Add-FirewallRuleIfMissing {
     param([string]$DisplayName, [int]$Port, [string]$Protocol = "TCP")
-    if (-not (Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue)) {
+    if (Test-FirewallRuleExistsByPortProtocol -LocalPort $Port -Protocol $Protocol -Direction Inbound) {
+        Write-Host "  Rule already exists for $Protocol port $Port (inbound); skipping." -ForegroundColor Cyan
+        return
+    }
+    $doCreate = $false
+    if ($script:NoPrompt) { $doCreate = $true } else {
+        $response = Read-Host "  No firewall rule found for $Protocol port $Port. Create rule '$DisplayName'? (y/n)"
+        if ($response -match '^[yY]') { $doCreate = $true }
+    }
+    if ($doCreate) {
         New-NetFirewallRule -DisplayName $DisplayName -Direction Inbound -Protocol $Protocol -LocalPort $Port -Action Allow | Out-Null
         Write-Log "Firewall rule created: $DisplayName (port $Port)" "Success" "Firewall"
         Write-Host "  Rule created: $DisplayName (port $Port)" -ForegroundColor Gray
-    }
+    } else { Write-Host "  Skipped." -ForegroundColor Yellow }
 }
 
 # EnsureWinRM: start service, quickconfig if needed, WSMan Basic/AllowUnencrypted/TrustedHosts, firewall 5985/5986 (consolidates fix-winrm + Enable-WindowsRemoteAccess WinRM part)
@@ -300,12 +469,14 @@ function Test-User {
         # Extract username part
         $userName = $Username.Split("\")[-1]
         
-        # Try local user first
+        # Try local user first (requires LocalAccounts module)
         try {
-            $userObj = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
-            if ($userObj) {
-                Write-Log "Found local user: $userName" "Info" "UserValidation"
-                return $true
+            if (Assert-ModuleAvailable "Microsoft.PowerShell.LocalAccounts" "Test-User (local lookup)" 2>$null) {
+                $userObj = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+                if ($userObj) {
+                    Write-Log "Found local user: $userName" "Info" "UserValidation"
+                    return $true
+                }
             }
         }
         catch {
@@ -367,6 +538,9 @@ function Test-UserInEventLogReaders {
         
         # Try to get group members using Get-LocalGroupMember
         try {
+            if (-not (Assert-ModuleAvailable "Microsoft.PowerShell.LocalAccounts" "Test-UserInEventLogReaders")) {
+                Write-Host "  Falling back to ADSI for group membership check..." -ForegroundColor Yellow
+            }
             $members = Get-LocalGroupMember -Group "Event Log Readers" -ErrorAction SilentlyContinue
             foreach ($member in $members) {
                 if ($member.Name -like "*$userName" -or $member.Name -eq $userName) {
@@ -550,32 +724,23 @@ function Set-FirewallRules {
     )
     
     try {
+        if (-not (Assert-ModuleAvailable "NetSecurity" "Set-FirewallRules")) {
+            Write-Host "  Cannot configure firewall rules without NetSecurity module." -ForegroundColor Red
+            return $false
+        }
         Write-Log "Configuring firewall rules for WEC communication" "Info" "Firewall"
-        
-        # Remove existing rules
-        Remove-NetFirewallRule -DisplayName "WinRM-HTTP-In" -ErrorAction SilentlyContinue
-        Remove-NetFirewallRule -DisplayName "WinRM-HTTPS-In" -ErrorAction SilentlyContinue
         
         # If specific port requested, create rule for that port only
         if ($Port -gt 0) {
             $ruleName = "WinRM-Custom-$Port-In"
             $description = "WinRM Custom Port $Port - Allow inbound connections for WEC log collection from $WecHostname ($WecIp)"
-            
-            New-NetFirewallRule -DisplayName $ruleName -Description $description -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -Profile Any
+            Add-FirewallRuleIfMissing -DisplayName $ruleName -Port $Port
             Write-Log "Created firewall rule for custom port $Port" "Success" "Firewall"
             Write-Host "✓ Created firewall rule for port $Port" -ForegroundColor Green
         } else {
-            # Create HTTP rule
-            $httpDescription = "WinRM HTTP (Port 5985) - Allow inbound connections for WEC log collection from $WecHostname ($WecIp)"
-            New-NetFirewallRule -DisplayName "WinRM-HTTP-In" -Description $httpDescription -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5985 -Profile Any
-            Write-Log "Created firewall rule for HTTP (port 5985)" "Success" "Firewall"
-            Write-Host "✓ Created firewall rule for HTTP (port 5985)" -ForegroundColor Green
-            
-            # Create HTTPS rule
-            $httpsDescription = "WinRM HTTPS (Port 5986) - Allow inbound connections for WEC log collection from $WecHostname ($WecIp)"
-            New-NetFirewallRule -DisplayName "WinRM-HTTPS-In" -Description $httpsDescription -Direction Inbound -Action Allow -Protocol TCP -LocalPort 5986 -Profile Any
-            Write-Log "Created firewall rule for HTTPS (port 5986)" "Success" "Firewall"
-            Write-Host "✓ Created firewall rule for HTTPS (port 5986)" -ForegroundColor Green
+            # Create HTTP and HTTPS rules using Add-FirewallRuleIfMissing (validates duplicates)
+            Add-FirewallRuleIfMissing -DisplayName "WinRM-HTTP-In" -Port 5985
+            Add-FirewallRuleIfMissing -DisplayName "WinRM-HTTPS-In" -Port 5986
         }
         
         return $true
@@ -606,43 +771,38 @@ function Set-WinRMPolicies {
         Write-Host ""
         Write-Host "Configuring policies..." -ForegroundColor Green
         
-        # Check and configure Allow Basic Authentication
+        # Check and configure Allow Basic Authentication (validate exists, prompt before create)
         $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service"
         $basicAuth = Get-ItemProperty -Path $regPath -Name "AllowBasic" -ErrorAction SilentlyContinue
         
         if (-not $basicAuth -or $basicAuth.AllowBasic -ne 1) {
-            Write-Host "  Configuring Allow Basic Authentication: " -NoNewline
-            try {
-                # Create registry path if it doesn't exist
-                if (-not (Test-Path $regPath)) {
-                    New-Item -Path $regPath -Force | Out-Null
-                }
-                Set-ItemProperty -Path $regPath -Name "AllowBasic" -Value 1 -Type DWord
-                Write-Host "Enabled" -ForegroundColor Green
-            }
-            catch {
-                Write-Host "Failed" -ForegroundColor Red
-            }
+            $doIt = $script:NoPrompt
+            if (-not $doIt) { $response = Read-Host "  Allow Basic Authentication is not configured. Create/update policy? (y/n)"; $doIt = ($response -match '^[yY]') }
+            if ($doIt) {
+                try {
+                    if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+                    Set-ItemProperty -Path $regPath -Name "AllowBasic" -Value 1 -Type DWord
+                    Write-Host "  Allow Basic Authentication: Enabled" -ForegroundColor Green
+                } catch { Write-Host "  Failed" -ForegroundColor Red }
+            } else { Write-Host "  Skipped." -ForegroundColor Yellow }
         } else {
-            Write-Host "  Allow Basic Authentication: " -NoNewline
-            Write-Host "Already configured" -ForegroundColor Cyan
+            Write-Host "  Allow Basic Authentication: Already configured" -ForegroundColor Cyan
         }
         
         # Check and configure Allow Unencrypted Traffic
         $unencrypted = Get-ItemProperty -Path $regPath -Name "AllowUnencrypted" -ErrorAction SilentlyContinue
         
         if (-not $unencrypted -or $unencrypted.AllowUnencrypted -ne 0) {
-            Write-Host "  Configuring Allow Unencrypted Traffic: " -NoNewline
-            try {
-                Set-ItemProperty -Path $regPath -Name "AllowUnencrypted" -Value 0 -Type DWord
-                Write-Host "Disabled" -ForegroundColor Green
-            }
-            catch {
-                Write-Host "Failed" -ForegroundColor Red
-            }
+            $doIt = $script:NoPrompt
+            if (-not $doIt) { $response = Read-Host "  Allow Unencrypted Traffic is not set as desired. Set to Disabled (0)? (y/n)"; $doIt = ($response -match '^[yY]') }
+            if ($doIt) {
+                try {
+                    Set-ItemProperty -Path $regPath -Name "AllowUnencrypted" -Value 0 -Type DWord
+                    Write-Host "  Allow Unencrypted Traffic: Disabled" -ForegroundColor Green
+                } catch { Write-Host "  Failed" -ForegroundColor Red }
+            } else { Write-Host "  Skipped." -ForegroundColor Yellow }
         } else {
-            Write-Host "  Allow Unencrypted Traffic: " -NoNewline
-            Write-Host "Already configured" -ForegroundColor Cyan
+            Write-Host "  Allow Unencrypted Traffic: Already configured" -ForegroundColor Cyan
         }
         
         # Check and configure Allow Remote Server Management
@@ -656,27 +816,36 @@ function Set-WinRMPolicies {
         if (-not $ipv6Input) { $ipv6Input = "" }
         if (-not $ipv4Filter -or -not $ipv6Filter -or $ipv4Filter.IPv4Filter -ne "*" -or $ipv6Filter.IPv6Filter -ne "*") {
             if (-not $ipv4Input -and -not $ipv6Input) {
-                Write-Host "  Configuring Allow Remote Server Management:" -ForegroundColor Green
-                Write-Host "    Enter IPv4 filter (default: *): " -NoNewline
-                $ipv4Input = Read-Host
-                if ([string]::IsNullOrWhiteSpace($ipv4Input)) { $ipv4Input = "*" }
-                Write-Host "    Enter IPv6 filter (default: *): " -NoNewline
-                $ipv6Input = Read-Host
-                if ([string]::IsNullOrWhiteSpace($ipv6Input)) { $ipv6Input = "*" }
+                Write-Host "  Allow Remote Server Management (IPv4/IPv6 filter) is not configured." -ForegroundColor Yellow
+                if ($script:NoPrompt) { $ipv4Input = "*"; $ipv6Input = "*" }
+                else {
+                    $response = Read-Host "  Create/update IP filters? (y/n)"
+                    if ($response -notmatch '^[yY]') { Write-Host "  Skipped." -ForegroundColor Yellow }
+                    else {
+                        Write-Host "    Enter IPv4 filter (default: *): " -NoNewline
+                        $ipv4Input = Read-Host
+                        if ([string]::IsNullOrWhiteSpace($ipv4Input)) { $ipv4Input = "*" }
+                        Write-Host "    Enter IPv6 filter (default: *): " -NoNewline
+                        $ipv6Input = Read-Host
+                        if ([string]::IsNullOrWhiteSpace($ipv6Input)) { $ipv6Input = "*" }
+                    }
+                }
             }
             if ([string]::IsNullOrWhiteSpace($ipv4Input)) { $ipv4Input = "*" }
             if ([string]::IsNullOrWhiteSpace($ipv6Input)) { $ipv6Input = "*" }
             
-            try {
-                Set-ItemProperty -Path $regPath -Name "IPv4Filter" -Value $ipv4Input -Type String
-                Set-ItemProperty -Path $regPath -Name "IPv6Filter" -Value $ipv6Input -Type String
-                Write-Host "    IPv4 Filter: " -NoNewline
-                Write-Host $ipv4Input -ForegroundColor Green
-                Write-Host "    IPv6 Filter: " -NoNewline
-                Write-Host $ipv6Input -ForegroundColor Green
-            }
-            catch {
-                Write-Host "    Failed to configure IP filters" -ForegroundColor Red
+            if ($ipv4Input -or $ipv6Input) {
+                $doIt = $script:NoPrompt
+                if (-not $doIt) { $response = Read-Host "  Set IPv4Filter=$ipv4Input IPv6Filter=$ipv6Input? (y/n)"; $doIt = ($response -match '^[yY]') }
+                if ($doIt) {
+                    try {
+                        if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+                        Set-ItemProperty -Path $regPath -Name "IPv4Filter" -Value $ipv4Input -Type String
+                        Set-ItemProperty -Path $regPath -Name "IPv6Filter" -Value $ipv6Input -Type String
+                        Write-Host "    IPv4 Filter: $ipv4Input" -ForegroundColor Green
+                        Write-Host "    IPv6 Filter: $ipv6Input" -ForegroundColor Green
+                    } catch { Write-Host "    Failed to configure IP filters" -ForegroundColor Red }
+                } else { Write-Host "  Skipped." -ForegroundColor Yellow }
             }
         } else {
             Write-Host "  Allow Remote Server Management: " -NoNewline
@@ -684,28 +853,23 @@ function Set-WinRMPolicies {
         }
         
         # Configure Configure Log Access - Always replace with the specified string via Registry
-        Write-Host "  Configuring Configure Log Access: " -NoNewline
-        try {
-            $newChannelAccess = "O:BAG:SYD:(A;;0xf0005;;;SY)(A;;0x5;;;BA)(A;;0x1;;;S-1-5-32-573)(A;;0x1;;;S-1-5-20)"
-            $regPathEventLog = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Security"
-            
-            # Create registry path if it doesn't exist
-            if (-not (Test-Path $regPathEventLog)) {
-                New-Item -Path $regPathEventLog -Force | Out-Null
-            }
-            
-            # Set ChannelAccess via Registry
-            Set-ItemProperty -Path $regPathEventLog -Name "ChannelAccess" -Value $newChannelAccess -Type String
-            
-            # Restart EventLog service to apply changes
-            Restart-Service EventLog -Force -ErrorAction SilentlyContinue
-            
-            Write-Host "Enabled" -ForegroundColor Green
-            Write-Host "    ChannelAccess: " -NoNewline
-            Write-Host $newChannelAccess -ForegroundColor Cyan
-        }
-        catch {
-            Write-Host "Failed - $($_.Exception.Message)" -ForegroundColor Red
+        $regPathEventLog = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Security"
+        $newChannelAccess = "O:BAG:SYD:(A;;0xf0005;;;SY)(A;;0x5;;;BA)(A;;0x1;;;S-1-5-32-573)(A;;0x1;;;S-1-5-20)"
+        $existingChannelAccess = Get-ItemProperty -Path $regPathEventLog -Name "ChannelAccess" -ErrorAction SilentlyContinue
+        if (-not $existingChannelAccess -or $existingChannelAccess.ChannelAccess -ne $newChannelAccess) {
+            $doIt = $script:NoPrompt
+            if (-not $doIt) { $response = Read-Host "  Configure Log Access (Event Log Security) is not set. Create/update? (y/n)"; $doIt = ($response -match '^[yY]') }
+            if ($doIt) {
+                try {
+                    if (-not (Test-Path $regPathEventLog)) { New-Item -Path $regPathEventLog -Force | Out-Null }
+                    Set-ItemProperty -Path $regPathEventLog -Name "ChannelAccess" -Value $newChannelAccess -Type String
+                    Restart-Service EventLog -Force -ErrorAction SilentlyContinue
+                    Write-Host "  Configure Log Access: Enabled" -ForegroundColor Green
+                    Write-Host "    ChannelAccess: $newChannelAccess" -ForegroundColor Cyan
+                } catch { Write-Host "  Failed - $($_.Exception.Message)" -ForegroundColor Red }
+            } else { Write-Host "  Skipped." -ForegroundColor Yellow }
+        } else {
+            Write-Host "  Configure Log Access: Already configured" -ForegroundColor Cyan
         }
         
         Write-Host ""
@@ -1029,12 +1193,11 @@ function Generate-Report {
             Recommendations = @()
         }
         
-        # System Information
+        # System Information (CimInstance is faster than WmiObject)
         Write-Host "Collecting system information..." -ForegroundColor Cyan
         try {
-            $computerInfo = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue
-            $osInfo = Get-WmiObject -Class Win32_OperatingSystem -ErrorAction SilentlyContinue
-            
+            $computerInfo = Get-CimInstance -ClassName Win32_ComputerSystem -Property Name,Domain -ErrorAction SilentlyContinue
+            $osInfo = Get-CimInstance -ClassName Win32_OperatingSystem -Property Caption,Version,OSArchitecture -ErrorAction SilentlyContinue
             $reportData.SystemInfo = @{
                 ComputerName = $computerInfo.Name
                 Domain = $computerInfo.Domain
@@ -1076,12 +1239,10 @@ function Generate-Report {
             Write-Host "  ⚠ Could not collect certificate information" -ForegroundColor Yellow
         }
         
-        # Firewall Rules
+        # Firewall Rules (targeted query by name pattern - avoids full enumeration)
         Write-Host "Collecting firewall rules..." -ForegroundColor Cyan
         try {
-            $firewallRules = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
-                $_.DisplayName -like "*WinRM*" -or $_.DisplayName -like "*WEC*"
-            }
+            $firewallRules = Get-WinRMFirewallRules
             $reportData.FirewallRules = @{
                 Count = $firewallRules.Count
                 Rules = $firewallRules | Select-Object DisplayName, Enabled, Direction
@@ -1155,6 +1316,45 @@ function Generate-Report {
         Write-Host ""
         Write-Host "Report generation completed!" -ForegroundColor Green
         
+        # Export to file if requested (ReportFormat Html/Txt and ReportOutputPath set)
+        $fmt = $script:ReportFormat
+        $outPath = $script:ReportOutputPath
+        if ($fmt -ne "Screen" -and $outPath) {
+            $outDir = Split-Path -Parent $outPath
+            if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+            try {
+                if ($fmt -eq "Txt") {
+                    $lines = @(
+                        "WinRM Configuration Report - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+                        "System: $($reportData.SystemInfo.ComputerName) | $($reportData.SystemInfo.OS) | $($reportData.SystemInfo.Architecture)",
+                        "WinRM Service: $($reportData.WinRMStatus.ServiceStatus) | StartType: $($reportData.WinRMStatus.StartType)",
+                        "Active Listeners: $($reportData.WinRMStatus.Listeners.Count)",
+                        "Certificates: $($reportData.Certificates.Count)",
+                        "Firewall Rules: $($reportData.FirewallRules.Count)",
+                        "Domain Controller: $($reportData.Policies.DomainController)",
+                        "Recommendations: $(($reportData.Recommendations) -join '; ')"
+                    )
+                    $lines | Out-File -FilePath $outPath -Encoding UTF8
+                } elseif ($fmt -eq "Html") {
+                    $html = @"
+<!DOCTYPE html><html><head><meta charset='utf-8'><title>WinRM Report</title><style>body{font-family:Segoe UI,sans-serif;margin:20px;} table{border-collapse:collapse;} th,td{border:1px solid #ccc;padding:6px;} th{background:#eee;}</style></head><body>
+<h1>WinRM Configuration Report</h1><p>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>
+<h2>System</h2><p>$($reportData.SystemInfo.ComputerName) | $($reportData.SystemInfo.OS) | $($reportData.SystemInfo.Architecture)</p>
+<h2>WinRM</h2><p>Service: $($reportData.WinRMStatus.ServiceStatus) | StartType: $($reportData.WinRMStatus.StartType) | Listeners: $($reportData.WinRMStatus.Listeners.Count)</p>
+<h2>Certificates</h2><p>Count: $($reportData.Certificates.Count)</p>
+<h2>Firewall Rules</h2><p>Count: $($reportData.FirewallRules.Count)</p>
+<h2>Recommendations</h2><ul>$(( $reportData.Recommendations | ForEach-Object { "<li>$_</li>" } ) -join '')</ul>
+</body></html>
+"@
+                    $html | Out-File -FilePath $outPath -Encoding UTF8
+                }
+                Write-Host "Report exported to: $outPath" -ForegroundColor Green
+                Write-Log "Report exported to $outPath" "Success" "Report"
+            } catch {
+                Write-Host "Export failed: $($_.Exception.Message)" -ForegroundColor Red
+            }
+        }
+        
         Write-Log "Comprehensive report generated successfully" "Success" "Report"
         return $reportData
     }
@@ -1211,7 +1411,7 @@ function Test-UserPermissions {
         Write-Host ""
         Write-Host "WMI Permissions:" -ForegroundColor Green
         try {
-            $wmiTest = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction SilentlyContinue
+            $wmiTest = Get-CimInstance -ClassName Win32_ComputerSystem -Property Name -ErrorAction SilentlyContinue
             if ($wmiTest) {
                 Write-Host "  ✓ WMI access is available" -ForegroundColor Green
             } else {
@@ -1457,12 +1657,10 @@ function Test-SecurityLogAccess {
     }
 }
 
-# Check Domain Controller status
+# Check Domain Controller status (uses Get-CimInstance - faster than Get-WmiObject)
 function Test-DomainController {
     try {
-        $computerSystem = Get-WmiObject -Class Win32_ComputerSystem
-        $domainRole = $computerSystem.DomainRole
-        
+        $domainRole = (Get-CimInstance -ClassName Win32_ComputerSystem -Property DomainRole -ErrorAction Stop).DomainRole
         if ($domainRole -eq 4 -or $domainRole -eq 5) {
             Write-Host "  Domain Controller Check: " -NoNewline
             Write-Host "Domain Controller" -ForegroundColor Green
@@ -1547,135 +1745,48 @@ function Get-SystemStatus {
         Write-Host "Inactive" -ForegroundColor Red
     }
     
-    # Firewall rules
+    # Firewall rules (targeted query — avoids full enumeration of all rules)
     Write-Host "`nFirewall Rules:" -ForegroundColor Green
-    
-    # Get WinRM-related firewall rules based on Port parameter
+    $allWinRMRules = Get-WinRMFirewallRules
     if ($Port -gt 0) {
-        # Search for specific port - include all WinRM/WEC rules for that port
-        $winrmRules = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
-            $rule = $_
-            $isWinRMRule = $false
-            
-            # Check if rule name or description contains WinRM or WEC (case insensitive)
-            if ($rule.DisplayName -like "*WinRM*" -or $rule.DisplayName -like "*WEC*" -or 
-                $rule.Description -like "*WinRM*" -or $rule.Description -like "*WEC*") {
-                $isWinRMRule = $true
-            }
-            
-            if ($isWinRMRule) {
-                try {
-                    $portFilter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
-                    if ($portFilter.LocalPort -eq $Port) { return $true }
-                }
-                catch { }
-            }
-            return $false
+        $winrmRules = $allWinRMRules | Where-Object {
+            try {
+                $pf = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $_ -ErrorAction SilentlyContinue
+                $pf -and $pf.LocalPort -eq $Port
+            } catch { $false }
         }
     } else {
-        # Get all WinRM/WEC related rules (default ports 5985, 5986 + any custom ports)
-        $winrmRules = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
-            $rule = $_
-            $isWinRMRule = $false
-            
-            # Check if rule name or description contains WinRM or WEC (case insensitive)
-            if ($rule.DisplayName -like "*WinRM*" -or $rule.DisplayName -like "*WEC*" -or 
-                $rule.Description -like "*WinRM*" -or $rule.Description -like "*WEC*") {
-                $isWinRMRule = $true
-            }
-            
-            if ($isWinRMRule) {
-                try {
-                    $portFilter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
-                    if ($portFilter.LocalPort) {
-                        # Include all WinRM/WEC rules regardless of port
-            return $true
-        }
-        }
-                catch { }
+        $winrmRules = $allWinRMRules
     }
-        return $false
-    }
-}
 
     if ($winrmRules) {
-        # Calculate column widths based on content
-        $maxNameLength = 0
-        $maxPortLength = 0
-        $maxStatusLength = 0
-        
-        foreach ($rule in $winrmRules) {
-            $nameLength = $rule.DisplayName.Length
-            if ($nameLength -gt $maxNameLength) { $maxNameLength = $nameLength }
-            
-            $portStr = "N/A"
-            try {
-            $portFilter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
-                if ($portFilter.LocalPort) {
-                    $portStr = $portFilter.LocalPort.ToString()
-        }
-    }
-    catch {
-                if ($rule.DisplayName -like "*HTTP*") { $portStr = "5985" }
-                elseif ($rule.DisplayName -like "*HTTPS*") { $portStr = "5986" }
-                elseif ($rule.DisplayName -like "*Custom*") { 
-                    if ($rule.DisplayName -match "WinRM-Custom-(\d+)-In") {
-                        $portStr = $matches[1]
-                    }
-                }
-            }
-            
-            if ($portStr.Length -gt $maxPortLength) { $maxPortLength = $portStr.Length }
-            if ($maxStatusLength -lt 7) { $maxStatusLength = 7 } # "Enabled" is 7 chars
-        }
-        
-        # Ensure minimum widths
+        $maxNameLength = ($winrmRules | ForEach-Object { $_.DisplayName.Length } | Measure-Object -Maximum).Maximum
         if ($maxNameLength -lt 55) { $maxNameLength = 55 }
-        if ($maxPortLength -lt 4) { $maxPortLength = 4 }
-        
-        # Create table header
-        $headerLine = "┌" + ("─" * ($maxNameLength + 2)) + "┬" + ("─" * ($maxPortLength + 2)) + "┬" + ("─" * ($maxStatusLength + 2)) + "┐"
+        $maxPortLength = 4
+        $maxStatusLength = 7
+        $headerLine   = "┌" + ("─" * ($maxNameLength + 2)) + "┬" + ("─" * ($maxPortLength + 2)) + "┬" + ("─" * ($maxStatusLength + 2)) + "┐"
         $separatorLine = "├" + ("─" * ($maxNameLength + 2)) + "┼" + ("─" * ($maxPortLength + 2)) + "┼" + ("─" * ($maxStatusLength + 2)) + "┤"
-        $footerLine = "└" + ("─" * ($maxNameLength + 2)) + "┴" + ("─" * ($maxPortLength + 2)) + "┴" + ("─" * ($maxStatusLength + 2)) + "┘"
-        
+        $footerLine   = "└" + ("─" * ($maxNameLength + 2)) + "┴" + ("─" * ($maxPortLength + 2)) + "┴" + ("─" * ($maxStatusLength + 2)) + "┘"
         Write-Host $headerLine -ForegroundColor Gray
         Write-Host "│ $("Rule Name".PadRight($maxNameLength)) │ $("Port".PadRight($maxPortLength)) │ $("Status".PadRight($maxStatusLength)) │" -ForegroundColor Gray
         Write-Host $separatorLine -ForegroundColor Gray
-        
         foreach ($rule in $winrmRules) {
             $portStr = "N/A"
-            
-            # Try to get port from the rule
             try {
-                $portFilter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
-                if ($portFilter.LocalPort) {
-                    $portStr = $portFilter.LocalPort.ToString()
-                }
-                }
-                catch {
-                # If we can't get port, try to determine from rule name
-                if ($rule.DisplayName -like "*HTTP*") { $portStr = "5985" }
+                $pf = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
+                if ($pf -and $pf.LocalPort) { $portStr = $pf.LocalPort.ToString() }
+            } catch {
+                if ($rule.DisplayName -like "*HTTP*" -and $rule.DisplayName -notlike "*HTTPS*") { $portStr = "5985" }
                 elseif ($rule.DisplayName -like "*HTTPS*") { $portStr = "5986" }
-                elseif ($rule.DisplayName -like "*Custom*") { 
-                    # Extract port from rule name like "WinRM-Custom-8080-In"
-                    if ($rule.DisplayName -match "WinRM-Custom-(\d+)-In") {
-                        $portStr = $matches[1]
-                    }
-                }
+                elseif ($rule.DisplayName -match "WinRM-Custom-(\d+)-In") { $portStr = $matches[1] }
             }
-            
             $status = if ($rule.Enabled -eq "True") { "Enabled" } else { "Disabled" }
-            $statusColor = if ($rule.Enabled -eq "True") { "Green" } else { "Red" }
-            
             Write-Host "│ $($rule.DisplayName.PadRight($maxNameLength)) │ $($portStr.PadRight($maxPortLength)) │ $($status.PadRight($maxStatusLength)) │" -ForegroundColor White
         }
         Write-Host $footerLine -ForegroundColor Gray
     } else {
-        if ($Port -gt 0) {
-            Write-Host "  No WinRM firewall rules found for port $Port" -ForegroundColor Yellow
-        } else {
-            Write-Host "  No WinRM firewall rules found for default ports (5985/5986)" -ForegroundColor Yellow
-        }
+        if ($Port -gt 0) { Write-Host "  No WinRM firewall rules found for port $Port" -ForegroundColor Yellow }
+        else { Write-Host "  No WinRM firewall rules found for default ports (5985/5986)" -ForegroundColor Yellow }
     }
     
     # WinRM Policies Check
@@ -2140,33 +2251,17 @@ function Main {
         }
         
         "ConfigureFirewall" {
+            if (-not (Assert-ModuleAvailable "NetSecurity" "ConfigureFirewall")) {
+                Write-Host "  Cannot manage firewall rules without the NetSecurity module." -ForegroundColor Red
+                return
+            }
             Write-Host ""
             Write-Host ("=" * 60) -ForegroundColor Cyan
             Write-Host "CONFIGURE WINRM FIREWALL RULES" -ForegroundColor Yellow
             Write-Host ("=" * 60) -ForegroundColor Cyan
             
-            # Get current WinRM firewall rules
-            $winrmRules = Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {
-                $rule = $_
-                $isWinRMRule = $false
-                
-                # Check if rule name or description contains WinRM or WEC (case insensitive)
-                if ($rule.DisplayName -like "*WinRM*" -or $rule.DisplayName -like "*WEC*" -or 
-                    $rule.Description -like "*WinRM*" -or $rule.Description -like "*WEC*") {
-                    $isWinRMRule = $true
-                }
-                
-                if ($isWinRMRule) {
-                    try {
-                        $portFilter = Get-NetFirewallPortFilter -AssociatedNetFirewallRule $rule -ErrorAction SilentlyContinue
-                        if ($portFilter.LocalPort) {
-                            return $true
-                        }
-                    }
-                    catch { }
-                }
-                return $false
-            }
+            # Get current WinRM firewall rules (targeted - fast)
+            $winrmRules = Get-WinRMFirewallRules
             
             if ($winrmRules) {
                 Write-Host "`nCurrent WinRM Firewall Rules:" -ForegroundColor Green
