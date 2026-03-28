@@ -404,6 +404,16 @@ GitHub: [github.com/Uniao-Geek](https://github.com/Uniao-Geek)
 
 ---
 
+<!-- LEGAL-NOTICE-UG-MRH -->
+
+## Legal notice / aviso legal
+
+- **Use** — For education, research, and **explicitly authorized** security testing only. Do not use against systems, networks, or data without formal permission; comply with applicable laws and policies.
+- **No warranty** — Provided **“as is” (AS IS)** without warranties of any kind (express or implied), including merchantability, fitness for a particular purpose, or non-infringement.
+- **Limitation of liability** — To the fullest extent permitted by law, the author(s) are **not liable** for direct or indirect damages, losses, misuse, third-party claims, or violation of third-party product terms. **Use at your own risk.**
+- **Attribution & community** — Preserve copyright notices and credit to the original project. **Pull requests**, improvements, and **issues** are welcome.
+- **License** — See the `LICENSE` file in the repository root (MIT).
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
