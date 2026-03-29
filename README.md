@@ -5,7 +5,9 @@
 [![Version](https://img.shields.io/badge/Version-2.3.2-orange.svg)](https://github.com/Uniao-Geek/WinRM-Log-Collector/releases)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> 🇧🇷 **Leia em Português:** [README-pt-BR.md](README-pt-BR.md)
+> 🇧🇷 **Portuguese (pt-BR):** [README.pt-BR.md](README.pt-BR.md) (same content as [README-pt-BR.md](README-pt-BR.md))
+
+**Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) · **Code of Conduct:** [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ---
 
