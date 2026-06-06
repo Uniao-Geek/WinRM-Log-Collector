@@ -1,4 +1,4 @@
-#requires -RunAsAdministrator
+﻿#requires -RunAsAdministrator
 
 <#
 .SYNOPSIS
@@ -59,7 +59,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("Enable", "Disable", "Status", "ConfigureFirewall", "ConfigurePolicies", "CheckPermissions", "ShowAllCerts", "ExportCACert", "Report", "ShowHelp", "ShowHelpLong", "EnsureWinRM", "ReadEvents")]
+    [ValidateSet("Enable", "Disable", "Status", "ConfigureFirewall", "ConfigurePolicies", "CheckPermissions", "ShowAllCerts", "ExportCACert", "Report", "ShowHelp", "ShowHelpLong", "EnsureWinRM", "ReadEvents", "SigmaFilter")]
     [string]$Action,
     
     [Parameter()]
@@ -2017,6 +2017,195 @@ function Show-DetailedHelp {
 }
 
 # Main execution
+
+# Author: Andre Henrique (@mrhenrike) | Uniao Geek - https://github.com/Uniao-Geek
+# Invoke-SigmaFilter: Read Windows Event Log entries and apply native Sigma-derived
+# detection patterns. No external tooling required.
+# Usage: .\winrmconfig.ps1 -Action SigmaFilter -Channel Security -Count 500
+function Invoke-SigmaFilter {
+    param(
+        [string]$Target = "localhost",
+        [string]$UserAccount = "",
+        [string]$PasswordPlain = "",
+        [string]$LogChannel = "Security",
+        [int]$MaxCount = 500
+    )
+
+    # Sigma-derived detection patterns for Windows Security events.
+    # Each rule has: Title, EventID(s), FieldMatches (hashtable of field->pattern),
+    # Severity, MITRE technique.
+    $SigmaRules = @(
+        @{
+            Title     = "Suspicious WinRM/PowerShell Remote Access"
+            EventIds  = @(4624)
+            Severity  = "HIGH"
+            Mitre     = "T1021.006"
+            Condition = { param($ev)
+                $logon = $ev.Properties[8].Value -as [string]
+                $process = $ev.Properties[17].Value -as [string]
+                ($logon -eq "3" -or $logon -eq "10") -and
+                ($process -like "*wsmprovhost*" -or $process -like "*powershell*")
+            }
+        },
+        @{
+            Title     = "Brute Force - Multiple Failed Logons Same Account"
+            EventIds  = @(4625)
+            Severity  = "MEDIUM"
+            Mitre     = "T1110"
+            Condition = { param($ev) $true }  # flagged by frequency in aggregation below
+            Aggregate = $true
+        },
+        @{
+            Title     = "Account Logon Outside Business Hours (00:00-06:00)"
+            EventIds  = @(4624)
+            Severity  = "LOW"
+            Mitre     = "T1078"
+            Condition = { param($ev)
+                $hour = $ev.TimeCreated.Hour
+                $logon = $ev.Properties[8].Value -as [string]
+                $hour -ge 0 -and $hour -lt 6 -and $logon -in @("2", "3", "10")
+            }
+        },
+        @{
+            Title     = "PowerShell Script Block Logging - Encoded Command"
+            EventIds  = @(4104)
+            Severity  = "HIGH"
+            Mitre     = "T1059.001"
+            Condition = { param($ev)
+                $msg = $ev.Message -as [string]
+                $msg -like "*EncodedCommand*" -or $msg -like "*-enc *" -or $msg -like "*-e *"
+            }
+        },
+        @{
+            Title     = "Event Log Cleared"
+            EventIds  = @(1102, 104)
+            Severity  = "CRITICAL"
+            Mitre     = "T1070.001"
+            Condition = { param($ev) $true }
+        },
+        @{
+            Title     = "New Local Account Created"
+            EventIds  = @(4720)
+            Severity  = "MEDIUM"
+            Mitre     = "T1136.001"
+            Condition = { param($ev) $true }
+        },
+        @{
+            Title     = "User Added to Privileged Group"
+            EventIds  = @(4728, 4732, 4756)
+            Severity  = "HIGH"
+            Mitre     = "T1078.003"
+            Condition = { param($ev) $true }
+        },
+        @{
+            Title     = "Scheduled Task Created"
+            EventIds  = @(4698)
+            Severity  = "MEDIUM"
+            Mitre     = "T1053.005"
+            Condition = { param($ev) $true }
+        }
+    )
+
+    Write-Host ""
+    Write-Host "================================================================"
+    Write-Host "  SigmaFilter - Windows Event Log Detection (native)"
+    Write-Host "  Channel: $LogChannel | Max events: $MaxCount | Target: $Target"
+    Write-Host "================================================================"
+    Write-Host ""
+
+    # Collect events
+    $events = @()
+    try {
+        if ($Target -eq "localhost" -or $Target -eq "" -or $Target -eq $null) {
+            $events = Get-WinEvent -LogName $LogChannel -MaxEvents $MaxCount -ErrorAction Stop
+        } else {
+            $secOptions = $null
+            if ($UserAccount) {
+                $pwd = ConvertTo-SecureString $PasswordPlain -AsPlainText -Force
+                $cred = New-Object System.Management.Automation.PSCredential($UserAccount, $pwd)
+                $events = Get-WinEvent -LogName $LogChannel -MaxEvents $MaxCount -ComputerName $Target -Credential $cred -ErrorAction Stop
+            } else {
+                $events = Get-WinEvent -LogName $LogChannel -MaxEvents $MaxCount -ComputerName $Target -ErrorAction Stop
+            }
+        }
+    } catch {
+        Write-Host "  [-] Could not read events from $LogChannel on $Target : $($_.Exception.Message)"
+        return
+    }
+
+    Write-Host "  [*] Read $($events.Count) events from $LogChannel"
+    Write-Host ""
+
+    $findings = @()
+    $eventId4625Count = @{}  # For brute-force aggregation
+
+    foreach ($ev in $events) {
+        foreach ($rule in $SigmaRules) {
+            if ($ev.Id -in $rule.EventIds) {
+                # Brute force: count 4625 per SubjectAccountName
+                if ($rule.Aggregate -and $ev.Id -eq 4625) {
+                    $acct = try { $ev.Properties[5].Value } catch { "unknown" }
+                    if (-not $eventId4625Count.ContainsKey($acct)) { $eventId4625Count[$acct] = 0 }
+                    $eventId4625Count[$acct]++
+                    continue
+                }
+                $match = $false
+                try { $match = & $rule.Condition $ev } catch { $match = $false }
+                if ($match) {
+                    $findings += [PSCustomObject]@{
+                        Time      = $ev.TimeCreated
+                        EventId   = $ev.Id
+                        Severity  = $rule.Severity
+                        Title     = $rule.Title
+                        Mitre     = $rule.Mitre
+                        Message   = ($ev.Message -as [string]) -replace "`r`n", " " | ForEach-Object { if ($_.Length -gt 200) { $_.Substring(0, 200) + "..." } else { $_ } }
+                    }
+                }
+            }
+        }
+    }
+
+    # Brute force aggregation: flag accounts with > 5 failures
+    foreach ($acct in $eventId4625Count.Keys) {
+        if ($eventId4625Count[$acct] -ge 5) {
+            $findings += [PSCustomObject]@{
+                Time      = Get-Date
+                EventId   = 4625
+                Severity  = "MEDIUM"
+                Title     = "Brute Force - Multiple Failed Logons Same Account"
+                Mitre     = "T1110"
+                Message   = "Account '$acct' had $($eventId4625Count[$acct]) failed logon attempts in the analysed window."
+            }
+        }
+    }
+
+    # Sort by severity and time
+    $sevOrder = @{ "CRITICAL" = 4; "HIGH" = 3; "MEDIUM" = 2; "LOW" = 1 }
+    $findings = $findings | Sort-Object { $sevOrder[$_.Severity] } -Descending
+
+    if ($findings.Count -eq 0) {
+        Write-Host "  [+] No Sigma-derived detections found in $($events.Count) events."
+        return
+    }
+
+    Write-Host "  Detections ($($findings.Count)):"
+    Write-Host "  $("-" * 62)"
+    foreach ($f in $findings) {
+        Write-Host "  [$($f.Severity)] $($f.Title)"
+        Write-Host "         EventID $($f.EventId) | $($f.Time) | MITRE: $($f.Mitre)"
+        if ($f.Message) {
+            $short = if ($f.Message.Length -gt 150) { $f.Message.Substring(0, 150) + "..." } else { $f.Message }
+            Write-Host "         $short"
+        }
+        Write-Host ""
+    }
+
+    $critCount = ($findings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+    $highCount = ($findings | Where-Object { $_.Severity -eq "HIGH" }).Count
+    $medCount  = ($findings | Where-Object { $_.Severity -eq "MEDIUM" }).Count
+    $lowCount  = ($findings | Where-Object { $_.Severity -eq "LOW" }).Count
+    Write-Host "  Summary: CRITICAL=$critCount  HIGH=$highCount  MEDIUM=$medCount  LOW=$lowCount"
+}
 function Main {
         Write-Host ""
     Write-Host ""
@@ -2670,6 +2859,11 @@ function Main {
             $portRead = $Port
             if (-not $portRead) { $portRead = if ($ListenerType -eq "https") { 5986 } else { 5985 } }
             Invoke-ReadEvents -Target $TargetHost -UserAccount $User -PasswordPlain $Password -TransportType $ListenerType -PortNum $portRead -LogChannel $Channel -MaxCount $Count -Order $SortOrder
+            Write-Host ""
+            Write-Host ""
+        }
+        "SigmaFilter" {
+            Invoke-SigmaFilter -Target $TargetHost -UserAccount $User -PasswordPlain $Password -LogChannel $Channel -MaxCount $Count
             Write-Host ""
             Write-Host ""
         }
